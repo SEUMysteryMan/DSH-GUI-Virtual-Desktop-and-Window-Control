@@ -1,0 +1,122 @@
+- insert:
+    - id: gui
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        # 工具名前缀：mcp__<serverName>__<工具名>
+        # 规则 ^[A-Za-z0-9_-]{1,32}$；改名后旧前缀 mcp__windows__ 不再存在。
+        serverName: gui
+        transport: stdio
+        # 不能写死 uvx 的绝对路径。
+        #
+        # 原先这里写的是 C:\Users\<某个人>\.local\bin\uvx.exe —— 那只是开发机上的位置。
+        # 换到任何别的机器（包括 Win11），这个文件不存在，spawn 直接 ENOENT，而
+        # dsh 只会把这件事故障成一句「initial connection or tool synchronization failed」，
+        # 用户完全看不出是缺了 uv。
+        #
+        # 现在按顺序探测常见安装位置，全部落空才退回裸名 'uvx'，交给 PATH 兜底。
+        # 探测本身不会抛错，所以配置求值一定成功 —— 配置求值失败会让整个插件行挂掉，
+        # 连"uvx 没装"这个线索都拿不到。
+        command: !!js >-
+          (() => {
+            const fs = process.getBuiltinModule('node:fs');
+            const path = process.getBuiltinModule('node:path');
+            const os = process.getBuiltinModule('node:os');
+            const home = os.homedir();
+            const candidates = [
+              // 手动覆盖优先：uv 装在奇葩位置的人设这一个变量就行。
+              process.env.GUI_UVX || '',
+              path.join(home, '.local', 'bin', 'uvx.exe'),              process.env.UV_INSTALL_DIR
+                ? path.join(process.env.UV_INSTALL_DIR, 'uvx.exe') : '',
+              process.env.LOCALAPPDATA
+                ? path.join(process.env.LOCALAPPDATA, 'Programs', 'uv', 'uvx.exe') : '',
+              path.join(process.env.CARGO_HOME || path.join(home, '.cargo'), 'bin', 'uvx.exe'),
+              path.join(process.env.ProgramData || 'C:\\ProgramData', 'chocolatey', 'bin', 'uvx.exe'),
+              'C:\\Program Files\\uv\\uvx.exe',
+            ];
+            for (const candidate of candidates) {
+              if (!candidate) continue;
+              try {
+                if (fs.existsSync(candidate)) return candidate;
+              } catch {}
+            }
+            // 退回裸名：dsh 的 args/command 直接透传、不过 shell，所以这里不能写 .cmd 包装。
+            // 走到这一步说明 uv 大概率没装，README 的故障排除里写了怎么装。
+            return 'uvx';
+          })()
+        args:
+          - '--python'
+          - '3.14'
+          # 依赖仍由 uvx 从 PyPI 装，但【必须钉版本】。
+          #
+          # 原来写的是裸 windows-mcp，本机早已缓存了 0.8.9 的解析结果，所以一直没事。
+          # 换台干净机器（比如那台 Win11），uvx 会现拉最新的 0.9.0 —— 上游每一次小版本
+          # 都可能动 CLI 参数和依赖图，钉住才能在别人机器上复现你验证过的行为。
+          # vendor 里的源码树就是 0.8.9，两者必须对齐。
+          - '--from'
+          - 'windows-mcp==0.8.9'
+          - 'windows-mcp'
+          - 'serve'
+          - '--transport'
+          - 'stdio'
+        env:
+          PYTHONUTF8: '1'
+          PYTHONIOENCODING: 'utf-8'
+          UV_NO_PROGRESS: '1'
+          # 本地分支只覆盖包本体，不接管依赖。
+          #
+          # 为什么不用 `--from <本地目录>`：uvx 对本地目录的构建缓存不跟文件 mtime 走，
+          # 改完源码它仍然复用上一次构建的产物（实测把整个中文版本都改掉了，跑起来还是
+          # 旧文案，而且看不出任何征兆）。PYTHONPATH 让源码直接生效，改一行就是一行，
+          # 不用清缓存、不用重装。
+          #
+          # 指向的目录必须是 windows-mcp 0.8.9 的全量源码树（完整的 windows_mcp/ 包），
+          # 不是只放增量文件的覆盖层 —— PYTHONPATH 一旦命中，同名的子模块全都从
+          # 这里取，缺文件就是 ImportError。
+          #
+          # 路径从本包位置反解，不写死绝对路径：写死的话换台机器、或者别人 clone 下来装，
+          # PYTHONPATH 就指向一个不存在的目录，而 dsh 不会因此报错 —— 它会静默落回
+          # PyPI 上游，于是 VirtualDesktop 消失、屏幕提示变回英文，看起来像"功能没做"。
+          # 源码树随包发布在包内的 vendor/windows-mcp（已在 package.json 的 files 里）。
+          PYTHONPATH: !!js >-
+            process.getBuiltinModule('node:path').join(
+              process.getBuiltinModule('node:path').dirname(
+                process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('dsh-gui-forkgo/package.json')
+              ),
+              'vendor',
+              'windows-mcp'
+            )
+        toolCallTimeoutMs: 120000
+        startupTimeoutMs: 300000
+        failOnStartupError: true
+        reconnect:
+          enabled: true
+          maxAttempts: 5
+
+# ② 把本包 skills/ 加进技能扫描根 —— 和多面手同一个做法。
+#
+# 为什么不是手写绝对路径：发布时不可能知道用户装在哪。用 !!js 在 loader 求值时
+# 从 baseUrl 反解出本包自己的位置，装到哪都对。
+#
+# 为什么按 id 整行覆盖：这两行在 web 模板里默认 disabled: true，覆盖时不写 disabled
+# 就等于重新启用。官方语义是「后层按 id 整行覆盖、config 整体替换不是深合并」，
+# 所以 name 和 config 都要写全，否则会把手势（includeDefaultRoots 等）打回默认。
+#
+# customSkillDirs 是「追加」到默认根之外，不会顶掉 profile 里已有的
+# $DSH_HOME/skills —— 两者并存，sherlock 那些不受影响。
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+  config:
+    includeDefaultRoots: false
+    customSkillDirs:
+      - !!js dshHomePath('skills')
+      - !!js >-
+          process.getBuiltinModule('node:path').join(
+            process.getBuiltinModule('node:path').dirname(
+              process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('dsh-gui-forkgo/package.json')
+            ),
+            'skills'
+          )
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
